@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"gopkg.in/yaml.v2"
 
 	"github.com/shirou/gopsutil/v3/mem"
+	"github.com/slingdata-io/sling-cli/core"
 	"github.com/slingdata-io/sling-cli/core/dbio/connection"
 	"github.com/slingdata-io/sling-cli/core/env"
 	"github.com/slingdata-io/sling-cli/core/sling"
@@ -208,7 +210,9 @@ func processRun(c *g.CliSC) (ok bool, err error) {
 runReplication:
 	defer connection.CloseAll()
 
-	g.Info(g.Colorize(g.ColorCyan, "Sling CLI | https://slingdata.io"))
+	if !cast.ToBool(os.Getenv("SLING_THREAD_CHILD")) {
+		g.Info(g.Colorize(g.ColorCyan, "Sling CLI | https://slingdata.io"))
+	}
 
 	if pipelineCfgPath != "" {
 		err = runPipeline(pipelineCfgPath)
@@ -278,6 +282,7 @@ func runTask(cfg *sling.Config, replication *sling.ReplicationConfig) (err error
 			taskOptions["tgt_adjust_column_type"] = task.Config.Target.Options.AdjustColumnType
 			taskOptions["tgt_column_casing"] = task.Config.Target.Options.ColumnCasing
 
+			taskMap["exec_id"] = task.ExecID
 			taskMap["md5"] = task.Config.MD5()
 			taskMap["type"] = task.Type
 			taskMap["mode"] = task.Config.Mode
@@ -388,6 +393,7 @@ func runTask(cfg *sling.Config, replication *sling.ReplicationConfig) (err error
 
 	// set log sink
 	env.LogSink = func(ll *g.LogLine) {
+		ll.Group = g.F("%s,%s", task.ExecID, task.Config.StreamID())
 		task.AppendOutput(ll)
 	}
 
@@ -472,6 +478,7 @@ func replicationRun(cfgPath string, cfgOverwrite *sling.Config, selectStreams ..
 	}
 
 	// parse hooks
+	isThreadChild := cast.ToBool(os.Getenv("SLING_THREAD_CHILD"))
 	startHooks, err := replication.ParseReplicationHook(sling.HookStageStart)
 	if err != nil {
 		return g.Error(err, "could not parse start hooks")
@@ -497,9 +504,11 @@ func replicationRun(cfgPath string, cfgOverwrite *sling.Config, selectStreams ..
 		g.Info("Sling Replication [%d streams] | %s -> %s", streamCnt, replication.Source, replication.Target)
 	}
 
-	// run start hooks
-	if err = startHooks.Execute(); err != nil {
-		return g.Error(err, "error executing start hooks")
+	// run start hooks if not thread child
+	if !isThreadChild {
+		if err = startHooks.Execute(); err != nil {
+			return g.Error(err, "error executing start hooks")
+		}
 	}
 
 	counter := 0
@@ -537,9 +546,11 @@ func replicationRun(cfgPath string, cfgOverwrite *sling.Config, selectStreams ..
 		}
 	}
 
-	// run end hooks
-	if err = endHooks.Execute(); err != nil {
-		eG.Capture(err, "end-hooks")
+	// run end hooks if not thread child
+	if !isThreadChild {
+		if err = endHooks.Execute(); err != nil {
+			eG.Capture(err, "end-hooks")
+		}
 	}
 
 	println()
@@ -561,6 +572,8 @@ func replicationRun(cfgPath string, cfgOverwrite *sling.Config, selectStreams ..
 }
 
 func runPipeline(pipelineCfgPath string) (err error) {
+	g.DebugLow("Sling version: %s (%s %s)", core.Version, runtime.GOOS, runtime.GOARCH)
+
 	pipeline, err := sling.LoadPipelineConfigFromFile(pipelineCfgPath)
 	if err != nil {
 		return g.Error(err, "could not load pipeline: %s", pipelineCfgPath)

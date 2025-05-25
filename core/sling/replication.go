@@ -640,6 +640,7 @@ func (rd *ReplicationConfig) ProcessWildcardsDatabase(c connection.Connection, p
 	} else if err = conn.Connect(); err != nil {
 		return wildcards, g.Error(err, "could not connect to database for wildcard processing: %s", rd.Source)
 	}
+	defer conn.Close() // causes issues for duckdb, let's close
 
 	for _, pattern := range patterns {
 		wildcard := Wildcard{Pattern: pattern, TableMap: map[string]database.Table{}}
@@ -1274,6 +1275,15 @@ func LoadReplicationConfig(content string) (config ReplicationConfig, err error)
 
 	// load compiled tasks if in env
 	if payload := os.Getenv("SLING_REPLICATION_TASKS"); payload != "" {
+		if strings.HasPrefix(payload, "file://") {
+			payloadPath := strings.TrimPrefix(payload, "file://")
+			bytes, err := os.ReadFile(payloadPath)
+			if err != nil {
+				err = g.Error(err, "Could not read replication tasks: "+payloadPath)
+				return config, err
+			}
+			payload = string(bytes)
+		}
 		if err = g.Unmarshal(payload, &config.Tasks); err != nil {
 			err = g.Error(err, "could not unmarshal replication compiled tasks")
 			return

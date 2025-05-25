@@ -148,6 +148,7 @@ func (conn *RedshiftConn) Unload(ctx *g.Context, tables ...Table) (s3Path string
 				"s3_path", s3PathPart,
 				"aws_access_key_id", AwsID,
 				"aws_secret_access_key", AwsAccessKey,
+				"aws_session_token_expr", AwsSessionTokenExpr,
 				"parallel", conn.GetProp("PARALLEL"),
 			)
 
@@ -293,6 +294,17 @@ func (conn *RedshiftConn) BulkImportFlow(tableFName string, df *iop.Dataflow) (c
 		return df.Count(), g.Error(err, "error writing to s3")
 	}
 	g.DebugLow("total written: %s to %s", humanize.Bytes(cast.ToUint64(bw)), s3Path)
+
+	// Close and re-establish connection to Redshift to avoid timeout
+	connectTime := cast.ToTime(conn.GetProp("connect_time"))
+	if time.Since(connectTime) > 10*time.Minute {
+		g.Debug("re-establishing redshift connection before COPY command")
+		conn.Close()
+		err = conn.Connect()
+		if err != nil {
+			return df.Count(), g.Error(err, "error reconnecting to redshift before COPY command")
+		}
+	}
 
 	_, err = conn.CopyFromS3(tableFName, s3Path, df.Columns)
 	if err != nil {

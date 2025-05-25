@@ -8,11 +8,11 @@ go test -v -run 'TestConnection'
 cd -
 
 cd iop
-go test -timeout 5m -v -run 'TestParseDate|TestDetectDelimiter|TestFIX|TestConstraints|TestDuckDb|TestParquetDuckDb|TestIcebergReader|TestDeltaReader|TestPartition|TestExtractPartitionTimeValue|TestGetLowestPartTimeUnit|TestMatchedPartitionMask|TestGeneratePartURIsFromRange|TestDataset|TestValidateNames'
+go test -timeout 5m -v -run 'TestParseDate|TestDetectDelimiter|TestFIX|TestConstraints|TestDuckDb|TestParquetDuckDb|TestIcebergReader|TestDeltaReader|TestPartition|TestExtractPartitionTimeValue|TestGetLowestPartTimeUnit|TestMatchedPartitionMask|TestGeneratePartURIsFromRange|TestDataset|TestValidateNames|TestExcelDateToTime'
 cd -
 
 cd database
-go test -v -run 'TestParseTableName|TestRegexMatch|TestParseColumnName'
+go test -v -run 'TestParseTableName|TestRegexMatch|TestParseColumnName|TestParseSQLMultiStatements|TestTrimSQLComments'
 go test -run TestChunkByColumnRange
 cd -
 
