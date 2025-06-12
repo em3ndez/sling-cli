@@ -88,8 +88,9 @@ type Connection interface {
 	GetColumns(tableFName string, fields ...string) (iop.Columns, error)
 	GetColumnsFull(string) (iop.Dataset, error)
 	GetColumnStats(tableName string, fields ...string) (columns iop.Columns, err error)
-	GetCount(string) (uint64, error)
+	GetCount(string) (int64, error)
 	GetDatabases() (iop.Dataset, error)
+	GetMaxValue(t Table, colName string) (value any, col iop.Column, err error)
 	GetDDL(string) (string, error)
 	GetGormConn(config *gorm.Config) (*gorm.DB, error)
 	GetIndexes(string) (iop.Dataset, error)
@@ -133,6 +134,7 @@ type Connection interface {
 	StreamRowsContext(ctx context.Context, sql string, options ...map[string]interface{}) (ds *iop.Datastream, err error)
 	SubmitTemplate(level string, templateMap map[string]string, name string, values map[string]interface{}) (data iop.Dataset, err error)
 	SwapTable(srcTable string, tgtTable string) (err error)
+	TableExists(table Table) (exists bool, err error)
 	Template() dbio.Template
 	Tx() Transaction
 	Unquote(string) string
@@ -261,6 +263,8 @@ func NewConnContext(ctx context.Context, URL string, props ...string) (Connectio
 		}
 	} else if strings.HasPrefix(URL, "redshift") {
 		conn = &RedshiftConn{URL: URL}
+	} else if strings.HasPrefix(URL, "athena") {
+		conn = &AthenaConn{URL: URL}
 	} else if strings.HasPrefix(URL, "trino") {
 		conn = &TrinoConn{URL: URL}
 	} else if strings.HasPrefix(URL, "sqlserver:") {
@@ -296,6 +300,10 @@ func NewConnContext(ctx context.Context, URL string, props ...string) (Connectio
 		conn = &SQLiteConn{URL: URL}
 	} else if strings.HasPrefix(URL, "duckdb:") || strings.HasPrefix(URL, "motherduck:") {
 		conn = &DuckDbConn{URL: URL}
+	} else if strings.HasPrefix(URL, "ducklake:") {
+		conn = &DuckLakeConn{DuckDbConn: DuckDbConn{URL: URL}}
+	} else if strings.HasPrefix(URL, "iceberg:") {
+		conn = &IcebergConn{URL: URL}
 	} else {
 		conn = &BaseConn{URL: URL}
 	}
@@ -347,7 +355,7 @@ func getDriverName(conn Connection) (driverName string) {
 		driverName = "snowflake"
 	case dbio.TypeDbSQLite:
 		driverName = "sqlite3"
-	case dbio.TypeDbDuckDb, dbio.TypeDbMotherDuck:
+	case dbio.TypeDbDuckDb, dbio.TypeDbMotherDuck, dbio.TypeDbDuckLake:
 		driverName = "duckdb"
 	case dbio.TypeDbSQLServer, dbio.TypeDbAzure:
 		driverName = "sqlserver"
@@ -702,6 +710,7 @@ func (conn *BaseConn) Connect(timeOut ...int) (err error) {
 	}
 
 	conn.SetProp("connected", "true")
+	conn.SetProp("connect_time", cast.ToString(time.Now()))
 
 	return nil
 }
@@ -966,18 +975,21 @@ func (conn *BaseConn) setTransforms(columns iop.Columns) {
 	// add new
 	for _, col := range columns {
 		key := strings.ToLower(col.Name)
-		if g.In(conn.Type, dbio.TypeDbAzure, dbio.TypeDbSQLServer, dbio.TypeDbAzureDWH) {
+		vals := colTransforms[key]
+		switch conn.Type {
+		case dbio.TypeDbAzure, dbio.TypeDbSQLServer, dbio.TypeDbAzureDWH:
 			if strings.ToLower(col.DbType) == "uniqueidentifier" {
-
-				if vals, ok := colTransforms[key]; ok {
-					// only add transform parse_ms_uuid if parse_uuid is not specified
-					if !lo.Contains(vals, "parse_uuid") {
-						g.Debug(`setting transform "parse_ms_uuid" for column "%s"`, col.Name)
-						colTransforms[key] = append([]string{"parse_ms_uuid"}, vals...)
-					}
-				} else {
-					g.Debug(`setting transform "parse_ms_uuid" for column %s`, col.Name)
-					colTransforms[key] = []string{"parse_ms_uuid"}
+				if !lo.Contains(vals, "parse_uuid") {
+					g.Debug(`setting transform "parse_ms_uuid" for column "%s"`, col.Name)
+					colTransforms[key] = append([]string{"parse_ms_uuid"}, vals...)
+				}
+			}
+		case dbio.TypeDbMySQL, dbio.TypeDbMariaDB, dbio.TypeDbStarRocks:
+			if strings.ToLower(col.DbType) == "bit" {
+				// only add transform parse_bit if binary_to_hex or binary_to_decimal is not specified
+				if !lo.Contains(vals, "binary_to_hex") && !lo.Contains(vals, "binary_to_decimal") {
+					g.Debug(`setting transform "parse_bit" for column "%s"`, col.Name)
+					colTransforms[key] = append([]string{"parse_bit"}, vals...)
 				}
 			}
 		}
@@ -1279,13 +1291,15 @@ func (conn *BaseConn) SubmitTemplate(level string, templateMap map[string]string
 }
 
 // GetCount returns count of records
-func (conn *BaseConn) GetCount(tableFName string) (uint64, error) {
+func (conn *BaseConn) GetCount(tableFName string) (int64, error) {
 	sql := fmt.Sprintf(`select count(*) cnt from %s`, tableFName)
 	data, err := conn.Self().Query(sql)
 	if err != nil {
 		return 0, err
+	} else if len(data.Rows) == 0 || len(data.Rows[0]) == 0 {
+		return 0, nil
 	}
-	return cast.ToUint64(data.Rows[0][0]), nil
+	return cast.ToInt64(data.Rows[0][0]), nil
 }
 
 // GetSchemas returns schemas
@@ -1496,19 +1510,14 @@ func (conn *BaseConn) GetSQLColumns(table Table) (columns iop.Columns, err error
 }
 
 // TableExists returns true if the table exists
-func TableExists(conn Connection, tableFName string) (exists bool, err error) {
-
-	table, err := ParseTableName(tableFName, conn.GetType())
-	if err != nil {
-		return false, g.Error(err, "could not parse table name: "+tableFName)
-	}
+func (conn *BaseConn) TableExists(table Table) (exists bool, err error) {
 
 	colData, err := conn.SubmitTemplate(
 		"single", conn.Template().Metadata, "columns",
 		g.M("schema", table.Schema, "table", table.Name),
 	)
 	if err != nil && !strings.Contains(err.Error(), "does not exist") {
-		return false, g.Error(err, "could not check table existence: "+tableFName)
+		return false, g.Error(err, "could not check table existence: "+table.FullName())
 	}
 
 	if len(colData.Rows) > 0 {
@@ -1656,6 +1665,42 @@ func (conn *BaseConn) GetIndexes(tableFName string) (iop.Dataset, error) {
 	)
 }
 
+// GetMaxValue get the max value of a column
+func (conn *BaseConn) GetMaxValue(table Table, colName string) (value any, maxCol iop.Column, err error) {
+	sql := g.F(
+		"select max(%s) as max_val from %s",
+		conn.Quote(colName),
+		table.FDQN(),
+	)
+
+	data, err := conn.Query(sql)
+	if err != nil {
+		errMsg := strings.ToLower(err.Error())
+		if strings.Contains(errMsg, "exist") ||
+			strings.Contains(errMsg, "not found") ||
+			strings.Contains(errMsg, "unknown") ||
+			strings.Contains(errMsg, "no such table") ||
+			strings.Contains(errMsg, "invalid object") {
+			// table does not exists, will be create later
+			// set val to blank for full load
+			return nil, maxCol, nil
+		}
+		err = g.Error(err, "could not get max value for "+colName)
+		return
+	}
+
+	if len(data.Rows) == 0 || len(data.Rows[0]) == 0 {
+		// table is empty
+		// set val to blank for full load
+		return nil, maxCol, nil
+	}
+
+	maxCol = data.Columns[0]
+	value = lo.Ternary(cast.ToString(data.Rows[0][0]) == "", nil, data.Rows[0][0])
+
+	return value, maxCol, nil
+}
+
 // GetDDL returns DDL for given table.
 func (conn *BaseConn) GetDDL(tableFName string) (string, error) {
 
@@ -1722,17 +1767,17 @@ func (conn *BaseConn) CreateTemporaryTable(tableName string, cols iop.Columns) (
 // `tableName` should have 'schema.table' format
 func (conn *BaseConn) CreateTable(tableName string, cols iop.Columns, tableDDL string) (err error) {
 
+	table, err := ParseTableName(tableName, conn.Type)
+	if err != nil {
+		return g.Error(err, "Could not parse table name: "+tableName)
+	}
+
 	// check table existence
-	exists, err := TableExists(conn, tableName)
+	exists, err := conn.TableExists(table)
 	if err != nil {
 		return g.Error(err, "Error checking table "+tableName)
 	} else if exists {
 		return nil
-	}
-
-	table, err := ParseTableName(tableName, conn.Type)
-	if err != nil {
-		return g.Error(err, "Could not parse table name: "+tableName)
 	}
 
 	// generate ddl
@@ -2088,7 +2133,7 @@ func (conn *BaseConn) CastColumnsForSelect(srcColumns iop.Columns, tgtColumns io
 		// don't normalize name, leave as is
 		selectExpr := conn.Self().Quote(srcCol.Name)
 
-		if srcCol.DbType != tgtCol.DbType {
+		if !strings.EqualFold(srcCol.DbType, tgtCol.DbType) {
 			g.Debug(
 				"inserting %s [%s] into %s [%s]",
 				srcCol.Name, srcCol.DbType, tgtCol.Name, tgtCol.DbType,
@@ -2296,6 +2341,35 @@ func (conn *BaseConn) GenerateDDL(table Table, data iop.Dataset, temporary bool)
 		columns = orderedColumns
 	}
 
+	// if temporary, and SQL Server, set factor for nvarchar
+	if temporary && conn.GetType().IsSQLServer() {
+		// modify column typing to increase factor for temp table
+		// see https://github.com/slingdata-io/sling-cli/issues/554
+		origColTyping := conn.GetProp("column_typing")
+		defer func() {
+			conn.SetProp("column_typing", origColTyping) // set back after DDL generation
+		}()
+
+		var ct iop.ColumnTyping
+		if origColTyping != "" {
+			g.Unmarshal(origColTyping, &ct)
+		}
+
+		cts := ct.String
+		if cts == nil {
+			cts = &iop.StringColumnTyping{}
+		}
+		if cts.LengthFactor < 2 {
+			cts.LengthFactor = 2 // set to allow buffer for replacement
+			cts.MinLength = 50   // set to allow buffer for replacement
+			cts.Note = "for temporary table buffer"
+		}
+		ct.String = cts
+
+		// marshal for DDL generation
+		conn.SetProp("column_typing", g.Marshal(ct))
+	}
+
 	for _, col := range columns {
 		// convert from general type to native type
 		nativeType, err := conn.Self().GetNativeType(col)
@@ -2323,7 +2397,7 @@ func (conn *BaseConn) GenerateDDL(table Table, data iop.Dataset, temporary bool)
 	ddl := g.R(
 		createTemplate,
 		"table", table.FullName(),
-		"col_types", strings.Join(columnsDDL, ",\n"),
+		"col_types", strings.Join(columnsDDL, ",\n  "),
 	)
 
 	return ddl, nil
@@ -2905,6 +2979,11 @@ func (conn *BaseConn) CompareChecksums(tableName string, columns iop.Columns) (e
 		}
 	}()
 
+	if g.In(conn.Type, dbio.TypeDbIceberg) {
+		g.Warn("cannot compare checksums for %s", conn.Type)
+		return nil
+	}
+
 	table, err := ParseTableName(tableName, conn.GetType())
 	if err != nil {
 		return g.Error(err, "could not parse table name")
@@ -3356,144 +3435,6 @@ func CopyFromAzure(conn Connection, tableFName, azPath string) (err error) {
 	}
 
 	return nil
-}
-
-// ParseSQLMultiStatements splits a sql text into statements
-// typically by a ';'
-func ParseSQLMultiStatements(sql string, Dialect ...dbio.Type) (sqls []string) {
-	inQuote := false
-	inCommentLine := false
-	inCommentMulti := false
-	char := ""
-	pChar := ""
-	nChar := ""
-	currState := ""
-
-	var dialect dbio.Type
-	if len(Dialect) > 0 {
-		dialect = Dialect[0]
-	}
-
-	inComment := func() bool {
-		return inCommentLine || inCommentMulti
-	}
-
-	// determine if is SQL code block
-	sqlLower := strings.TrimRight(strings.TrimSpace(strings.ToLower(sql)), ";")
-	if strings.HasPrefix(sqlLower, "begin") && strings.HasSuffix(sqlLower, "end") {
-		return []string{sql}
-	} else if strings.Contains(sqlLower, "prepare ") && strings.Contains(sqlLower, "execute ") {
-		return []string{sql}
-	}
-
-	for i := range sql {
-		char = string(sql[i])
-
-		// previous
-		if i > 0 {
-			pChar = string(sql[i-1])
-		}
-
-		// next
-		nChar = ""
-		if i+1 < len(sql) {
-			nChar = string(sql[i+1])
-		}
-
-		switch {
-		case !inQuote && !inComment() && char == "'":
-			inQuote = true
-		case inQuote && char == "'" && nChar != "'":
-			inQuote = false
-		case !inQuote && !inComment() && pChar == "-" && char == "-":
-			inCommentLine = true
-		case inCommentLine && char == "\n":
-			inCommentLine = false
-		case !inQuote && !inComment() && pChar == "/" && char == "*":
-			inCommentMulti = true
-		case inCommentMulti && pChar == "*" && char == "/":
-			inCommentMulti = false
-		}
-
-		currState = currState + char
-
-		// detect end
-		if char == ";" && !inQuote && !inComment() {
-			if currState = strings.TrimSpace(currState); currState != "" {
-				if !g.In(dialect, dbio.TypeDbSQLServer, dbio.TypeDbAzure, dbio.TypeDbAzureDWH) {
-					currState = strings.TrimSuffix(currState, ";")
-				}
-				sqls = append(sqls, currState)
-			}
-			currState = ""
-		}
-	}
-
-	if len(currState) > 0 {
-		if currState = strings.TrimSpace(currState); currState != "" {
-			if !g.In(dialect, dbio.TypeDbSQLServer, dbio.TypeDbAzure, dbio.TypeDbAzureDWH) {
-				currState = strings.TrimSuffix(currState, ";")
-			}
-			sqls = append(sqls, currState)
-		}
-	}
-
-	return
-}
-
-// GenerateAlterDDL generate a DDL based on a dataset
-func GenerateAlterDDL(conn Connection, table Table, newColumns iop.Columns) (bool, error) {
-
-	if len(table.Columns) != len(newColumns) {
-		return false, g.Error("different column lenght %d != %d", len(table.Columns), len(newColumns))
-	}
-
-	colDDLs := []string{}
-	for i, col := range table.Columns {
-		newCol := newColumns[i]
-
-		if col.Type == newCol.Type {
-			continue
-		}
-
-		// convert from general type to native type
-		nativeType, err := conn.GetNativeType(newCol)
-		if err != nil {
-			return false, g.Error(err, "no native mapping")
-		}
-
-		switch {
-		case col.Type.IsString():
-			// alter field to resize column
-			colDDL := g.R(
-				conn.GetTemplateValue("core.modify_column"),
-				"column", conn.Self().Quote(col.Name),
-				"type", nativeType,
-			)
-			colDDLs = append(colDDLs, colDDL)
-		default:
-			// alter field to resize column
-			colDDL := g.R(
-				conn.GetTemplateValue("core.modify_column"),
-				"column", conn.Self().Quote(col.Name),
-				"type", nativeType,
-			)
-			colDDLs = append(colDDLs, colDDL)
-		}
-
-	}
-
-	ddl := g.R(
-		conn.GetTemplateValue("core.alter_columns"),
-		"table", table.FullName(),
-		"col_ddl", strings.Join(colDDLs, ", "),
-	)
-	_, err := conn.Exec(ddl)
-	if err != nil {
-		return false, g.Error(err, "could not alter columns on table "+table.FullName())
-	}
-
-	return true, nil
 }
 
 func Clone(conn Connection) (newConn Connection, err error) {

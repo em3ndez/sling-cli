@@ -459,10 +459,10 @@ func (t *TaskExecution) runFileToDB() (err error) {
 		}
 		t.Context.Map.Set("incremental_value", t.Config.IncrementalValStr)
 	} else if t.isIncrementalWithUpdateKey() {
-		t.SetProgress("getting checkpoint value")
 		if t.Config.Source.UpdateKey == "." {
 			t.Config.Source.UpdateKey = slingLoadedAtColumn
 		}
+		t.SetProgress(g.F("getting checkpoint value (%s)", t.Config.Source.UpdateKey))
 
 		if err = getIncrementalValueViaDB(t.Config, tgtConn, dbio.TypeDbDuckDb); err != nil {
 			err = g.Error(err, "Could not get incremental value")
@@ -537,7 +537,11 @@ func (t *TaskExecution) runApiToDb() (err error) {
 		return
 	}
 
-	if t.isIncrementalState() {
+	if t.Config.Mode == IncrementalMode {
+		if os.Getenv("SLING_STATE") == "" {
+			g.Warn("Please use the SLING_STATE environment variable for incremental mode with APIs")
+			goto skipGetState
+		}
 		if err = getIncrementalValueViaState(t); err != nil {
 			err = g.Error(err, "Could not get incremental value")
 			return err
@@ -555,9 +559,8 @@ func (t *TaskExecution) runApiToDb() (err error) {
 			err = g.Error(err, "Could not put API sync state value")
 			return err
 		}
-	} else if t.isIncrementalWithUpdateKey() {
-		return g.Error("Please use the SLING_STATE environment variable for storing state for APIs")
 	}
+skipGetState:
 
 	t.df, err = t.ReadFromApi(t.Config, srcConn)
 	if err != nil {
@@ -614,7 +617,11 @@ func (t *TaskExecution) runApiToFile() (err error) {
 		return
 	}
 
-	if t.isIncrementalState() {
+	if t.Config.Mode == IncrementalMode {
+		if os.Getenv("SLING_STATE") == "" {
+			g.Warn("Please use the SLING_STATE environment variable for incremental mode with APIs")
+			goto skipGetState
+		}
 		if err = getIncrementalValueViaState(t); err != nil {
 			err = g.Error(err, "Could not get incremental value")
 			return err
@@ -633,9 +640,8 @@ func (t *TaskExecution) runApiToFile() (err error) {
 			err = g.Error(err, "Could not put API sync state value")
 			return err
 		}
-	} else if t.isIncrementalWithUpdateKey() {
-		return g.Error("Please use the SLING_STATE environment variable for storing state for APIs")
 	}
+skipGetState:
 
 	t.df, err = t.ReadFromApi(t.Config, srcConn)
 	if err != nil {
@@ -770,7 +776,7 @@ func (t *TaskExecution) runDbToDb() (err error) {
 		}
 		t.Context.Map.Set("incremental_value", t.Config.IncrementalValStr)
 	} else if t.isIncrementalWithUpdateKey() {
-		t.SetProgress("getting checkpoint value")
+		t.SetProgress(g.F("getting checkpoint value (%s)", t.Config.Source.UpdateKey))
 		if err = getIncrementalValueViaDB(t.Config, tgtConn, srcConn.GetType()); err != nil {
 			err = g.Error(err, "Could not get incremental value")
 			return err

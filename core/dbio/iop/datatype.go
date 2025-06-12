@@ -563,6 +563,10 @@ func (cols Columns) Coerce(castCols Columns, hasHeader bool, casing ColumnCasing
 	newCols = newCols.ValidateNames(tgtType)
 
 	for i, col := range newCols {
+		if strings.HasPrefix(col.Description, "Sling.Metadata.") {
+			continue // do not modify metadata type
+		}
+
 		if !hasHeader && len(castCols) == len(newCols) {
 			// assume same order since same number of columns and no header
 			col = castCols[i]
@@ -873,6 +877,10 @@ func (col *Column) SetConstraint() {
 // ValidateNames truncates the column name it exceed the max column length
 func (cols Columns) ValidateNames(tgtType dbio.Type) (newCols Columns) {
 	newCols = cols
+	if string(tgtType) == "" {
+		return
+	}
+
 	maxLength := cast.ToInt(tgtType.GetTemplateValue("variable.max_column_length"))
 	if maxLength == 0 {
 		return
@@ -1221,7 +1229,11 @@ func (col *Column) GetNativeType(t dbio.Type, ct ColumnTyping) (nativeType strin
 				if ct.String != nil {
 					newLength := ct.String.Apply(length, maxStringLength)
 					if newLength != length {
-						g.Debug(`  applied length type mapping for column "%s" (%d => %d)`, col.Name, length, newLength)
+						if ct.String.Note != "" {
+							g.Debug(`  applied string length mapping for column "%s" (%d => %d) [%s]`, col.Name, length, newLength, ct.String.Note)
+						} else {
+							g.Debug(`  applied string length mapping for column "%s" (%d => %d)`, col.Name, length, newLength)
+						}
 					}
 					length = newLength
 				}
@@ -1271,6 +1283,10 @@ func (col *Column) GetNativeType(t dbio.Type, ct ColumnTyping) (nativeType strin
 			"(,)",
 			fmt.Sprintf("(%d,%d)", precision, scale),
 		)
+	} else if col.Type.IsJSON() {
+		if ct.JSON != nil {
+			ct.JSON.Apply(col)
+		}
 	}
 
 	return
@@ -1427,6 +1443,7 @@ func (cc *ColumnCasing) Apply(name string, tgtConnType dbio.Type) string {
 type ColumnTyping struct {
 	String  *StringColumnTyping  `json:"string,omitempty" yaml:"string,omitempty"`
 	Decimal *DecimalColumnTyping `json:"decimal,omitempty" yaml:"decimal,omitempty"`
+	JSON    *JsonColumnTyping    `json:"json,omitempty" yaml:"json,omitempty"`
 }
 
 // StringColumnTyping contains string type mapping configurations
@@ -1435,6 +1452,8 @@ type StringColumnTyping struct {
 	MinLength    int  `json:"min_length,omitempty" yaml:"min_length,omitempty"`
 	MaxLength    int  `json:"max_length,omitempty" yaml:"max_length,omitempty"`
 	UseMax       bool `json:"use_max,omitempty" yaml:"use_max,omitempty"`
+
+	Note string `json:"note,omitempty" yaml:"note,omitempty"`
 }
 
 func (sct *StringColumnTyping) Apply(length, max int) (newLength int) {
@@ -1479,6 +1498,9 @@ func (dct *DecimalColumnTyping) Apply(col *Column) (precision, scale int) {
 
 	precision = col.DbPrecision
 	scale = col.DbScale
+	if col.Stats.MaxDecLen > scale {
+		scale = col.Stats.MaxDecLen
+	}
 
 	if precision == 0 {
 		minPrecision := col.Stats.MaxLen + scale
@@ -1510,4 +1532,16 @@ func (dct *DecimalColumnTyping) Apply(col *Column) (precision, scale int) {
 	}
 
 	return
+}
+
+// JsonColumnTyping contains json type mapping configurations
+type JsonColumnTyping struct {
+	AsText bool `json:"as_text,omitempty" yaml:"as_text,omitempty"`
+}
+
+func (jct *JsonColumnTyping) Apply(col *Column) {
+	if jct.AsText {
+		// set to text type
+		col.Type = TextType
+	}
 }

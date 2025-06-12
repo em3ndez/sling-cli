@@ -2,6 +2,7 @@ package iop
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -26,7 +27,7 @@ import (
 )
 
 var (
-	DuckDbVersion      = "1.1.3"
+	DuckDbVersion      = "1.3.0"
 	DuckDbUseTempFile  = false
 	duckDbReadOnlyHint = "/* -readonly */"
 	duckDbSOFMarker    = "___start_of_duckdb_result___"
@@ -44,6 +45,7 @@ type DuckDb struct {
 }
 
 type duckDbQuery struct {
+	SQL     string
 	Context *g.Context
 	reader  *io.PipeReader
 	writer  *io.PipeWriter
@@ -137,6 +139,7 @@ func (duck *DuckDb) PrepareFsSecretAndURI(uri string) string {
 			"REGION":            "REGION",
 			"SESSION_TOKEN":     "SESSION_TOKEN",
 			"ENDPOINT":          "ENDPOINT",
+			"PROFILE":           "PROFILE",
 			"USE_SSL":           "USE_SSL",
 			"URL_STYLE":         "URL_STYLE",
 		}
@@ -178,6 +181,9 @@ func (duck *DuckDb) PrepareFsSecretAndURI(uri string) string {
 		secretKeyMap = map[string]string{
 			"CONN_STR":                "CONNECTION_STRING",
 			"ACCOUNT":                 "ACCOUNT_NAME",
+			"ACCOUNT_KEY":             "ACCOUNT_KEY",
+			"SAS_TOKEN":               "SAS_TOKEN",
+			"CLIENT_SECRET":           "CLIENT_SECRET",
 			"HTTP_PROXY":              "HTTP_PROXY",
 			"PROXY_USER_NAME":         "PROXY_USER_NAME",
 			"PROXY_PASSWORD":          "PROXY_PASSWORD",
@@ -234,9 +240,9 @@ func (duck *DuckDb) PrepareFsSecretAndURI(uri string) string {
 func (duck *DuckDb) getLoadExtensionSQL() (sql string) {
 	for _, extension := range duck.extensions {
 		if cast.ToBool(os.Getenv("DUCKDB_USE_INSTALLED_EXTENSIONS")) {
-			sql += fmt.Sprintf("; LOAD %s;", extension)
+			sql += fmt.Sprintf("LOAD %s;", extension)
 		} else {
-			sql += fmt.Sprintf(";INSTALL %s; LOAD %s;", extension, extension)
+			sql += fmt.Sprintf("INSTALL %s; LOAD %s;", extension, strings.TrimSuffix(extension, "from community"))
 		}
 	}
 	return
@@ -394,8 +400,11 @@ func (duck *DuckDb) SubmitSQL(sql string, showChanges bool) (err error) {
 
 	// submit sql to stdin
 	sqlLines := []string{
-		extensionsSQL + ";",
-		secretSQL + ";",
+		strings.Trim(extensionsSQL, ";") + ";",
+		strings.Trim(secretSQL, ";") + ";",
+		// preserve_insertion_order=false reduces the memory load.
+		// See https://www.reddit.com/r/DuckDB/comments/1jnw1ed/got_outofmemory_while_etl_30gb_parquet_files_on_s3/
+		"set preserve_insertion_order = false;",
 		g.R("select '{v}' AS marker_{id};", "v", duckDbSOFMarker, "id", queryID),
 		".changes on",
 		sql + ";",
@@ -460,7 +469,7 @@ func (duck *DuckDb) ExecContext(ctx context.Context, sql string, args ...interfa
 	duck.Context.Lock()
 	defer duck.Context.Unlock()
 
-	dq := duck.newQuery(ctx)
+	dq := duck.newQuery(ctx, sql)
 
 	result = duckDbResult{}
 
@@ -500,9 +509,10 @@ func (duck *DuckDb) ExecContext(ctx context.Context, sql string, args ...interfa
 	return result, nil
 }
 
-func (duck *DuckDb) newQuery(ctx context.Context) (query *duckDbQuery) {
+func (duck *DuckDb) newQuery(ctx context.Context, sql string) (query *duckDbQuery) {
 	stdOutReader, stdOutWriter := io.Pipe() // new pipe
 	duck.query = &duckDbQuery{
+		SQL:     sql,
 		Context: g.NewContext(ctx),
 		reader:  stdOutReader,
 		writer:  stdOutWriter,
@@ -616,10 +626,7 @@ func (duck *DuckDb) StreamContext(ctx context.Context, sql string, options ...ma
 		opts = options[0]
 	}
 
-	columns, err := duck.Describe(sql)
-	if err != nil {
-		return nil, g.Error(err, "could not get columns")
-	}
+	columns, describeErr := duck.Describe(sql)
 
 	// one query at a time
 	duck.Context.Lock()
@@ -628,7 +635,7 @@ func (duck *DuckDb) StreamContext(ctx context.Context, sql string, options ...ma
 	ds = NewDatastreamContext(queryCtx.Ctx, columns)
 
 	// Create a pipe for stdout, stderr handling
-	dq := duck.newQuery(queryCtx.Ctx)
+	dq := duck.newQuery(queryCtx.Ctx, sql)
 
 	// start and submit sql
 	err = duck.SubmitSQL(sql, false)
@@ -685,6 +692,10 @@ func (duck *DuckDb) StreamContext(ctx context.Context, sql string, options ...ma
 
 	if dq.err != nil {
 		return ds, dq.err
+	} else if describeErr != nil {
+		// should never occur, since if Describe fails, SubmitSQL should fail
+		// to get better error. but just in case it does, log error
+		g.LogError(describeErr)
 	}
 
 	return
@@ -734,7 +745,8 @@ func (duck *DuckDb) initScanner() {
 
 			errString.WriteString(line)
 			errTimer = time.AfterFunc(25*time.Millisecond, func() {
-				duck.query.err = g.Error(errString.String())
+				suffix := g.F("For query => %s", duck.query.SQL)
+				duck.query.err = g.Error(errString.String() + "\n" + suffix)
 				errString.Reset()
 				resetWriter() // in case writer is active
 			})
@@ -985,8 +997,9 @@ func EnsureBinDuckDB(version string) (binPath string, err error) {
 // Describe returns the columns of a query
 func (duck *DuckDb) Describe(query string) (columns Columns, err error) {
 	// prevent infinite loop
-	queryL := strings.TrimSpace(strings.ToLower(query))
-	if strings.HasPrefix(queryL, "describe ") || strings.HasPrefix(queryL, "pragma ") {
+	queryStriped, _ := StripSQLComments(query)
+	queryL := strings.TrimSpace(strings.ToLower(queryStriped))
+	if !(strings.HasPrefix(queryL, "with") || strings.HasPrefix(queryL, "select")) {
 		return columns, nil
 	}
 
@@ -1000,9 +1013,21 @@ func (duck *DuckDb) Describe(query string) (columns Columns, err error) {
 
 		col.Name = cast.ToString(rec["column_name"])
 		col.DbType = cast.ToString(rec["column_type"])
-		col.Type = NativeTypeToGeneral(col.Name, cast.ToString(rec["column_type"]), dbio.TypeDbDuckDb)
+		col.Type = NativeTypeToGeneral(col.Name, col.DbType, dbio.TypeDbDuckDb)
 		col.Position = k + 1
 		col.Sourced = true
+
+		// fill in precision/scale if decimal
+		if dbType := strings.ToLower(col.DbType); strings.HasPrefix(dbType, "decimal(") {
+			dbType = strings.ReplaceAll(dbType, " ", "")
+			precScale := strings.ReplaceAll(dbType, "decimal", "")
+			precScale = strings.Trim(precScale, "()")
+			precScaleParts := strings.Split(precScale, ",")
+			col.DbPrecision = cast.ToInt(precScaleParts[0])
+			if len(precScaleParts) > 1 {
+				col.DbScale = cast.ToInt(precScaleParts[1])
+			}
+		}
 
 		columns = append(columns, col)
 	}
@@ -1049,7 +1074,16 @@ func (duck *DuckDb) DataflowToHttpStream(df *Dataflow, sc StreamConfig) (streamP
 		return streamPartChn, err
 	}
 	// create reader channel to pass between handler and main flow
-	readerCh := make(chan io.Reader, 1)
+	readerCh := make(chan io.Reader)
+	doneCh := make(chan bool)
+
+	// determine content type and format based on sc.Format
+	contentType := "text/csv"
+	format := dbio.FileTypeCsv // default to CSV
+	if sc.Format == dbio.FileTypeArrow {
+		contentType = "application/vnd.apache.arrow.stream"
+		format = dbio.FileTypeArrow
+	}
 
 	// create http server to serve data
 	importContext := g.NewContext(duck.Context.Ctx)
@@ -1060,18 +1094,16 @@ func (duck *DuckDb) DataflowToHttpStream(df *Dataflow, sc StreamConfig) (streamP
 		server.HideBanner = true
 		// server.Use(middleware.Logger())
 		server.Add(http.MethodGet, "/data", func(c echo.Context) (err error) {
-			select {
-			case reader := <-readerCh:
-				if reader != nil {
-					return c.Stream(200, "text/csv", reader)
-				}
-			default:
+			reader := <-readerCh
+			if reader != nil {
+				defer func() { doneCh <- true }()
+				return c.Stream(200, contentType, reader)
 			}
 			return c.NoContent(http.StatusOK)
 		})
 
 		server.Add(http.MethodHead, "/data", func(c echo.Context) error {
-			c.Response().Header().Set("Content-Type", "text/csv")
+			c.Response().Header().Set("Content-Type", contentType)
 			return c.NoContent(http.StatusOK)
 		})
 
@@ -1091,26 +1123,66 @@ func (duck *DuckDb) DataflowToHttpStream(df *Dataflow, sc StreamConfig) (streamP
 	time.Sleep(100 * time.Millisecond)
 	df.Defer(func() { server.Shutdown(importContext.Ctx) })
 
+	sc.BatchLimit = 50000               // since it's ready all in memory
+	sc.FileMaxBytes = 100 * 1024 * 1024 // since it's ready all in memory
+
 	df.SetBatchLimit(sc.BatchLimit)
 	ds := MergeDataflow(df)
 
 	go func() {
 		defer close(streamPartChn)
 		var partIndex int
-		for batchR := range ds.NewCsvReaderChnl(sc) {
-			g.Trace("processing duckdb batch %s", batchR.Batch.ID())
-			readerCh <- batchR.Reader
 
-			// can use this as a from table
-			fromExpr := g.F(`read_csv('%s', delim=',', header=True, columns=%s, max_line_size=134217728, parallel=false, quote='"', escape='"', nullstr='\N', auto_detect=false)`, httpURL, duck.GenerateCsvColumns(batchR.Columns))
+		if format == dbio.FileTypeArrow {
+			// Use Arrow format
+			for batchR := range ds.NewArrowReaderChnl(sc) {
+				g.Trace("processing duckdb arrow batch %s", batchR.Batch.ID())
 
-			streamPartChn <- HttpStreamPart{
-				Index:    partIndex,
-				FromExpr: fromExpr,
-				Columns:  batchR.Columns,
+				// buffer all the data first to avoid deadlock
+				data, err := io.ReadAll(batchR.Reader)
+				if err != nil {
+					g.Error(err, "failed to read arrow batch")
+					return
+				}
+
+				// Use read_arrow_ipc for Arrow format
+				fromExpr := g.F(`read_arrow('%s')`, httpURL)
+
+				streamPartChn <- HttpStreamPart{
+					Index:    partIndex,
+					FromExpr: fromExpr,
+					Columns:  batchR.Columns,
+				}
+				readerCh <- bytes.NewReader(data)
+				<-doneCh
+
+				partIndex++
 			}
+		} else {
+			// Default to CSV format
+			for batchR := range ds.NewCsvReaderChnl(sc) {
+				g.Trace("processing duckdb batch %s", batchR.Batch.ID())
 
-			partIndex++
+				// buffer all the data first to avoid deadlock
+				data, err := io.ReadAll(batchR.Reader)
+				if err != nil {
+					g.Error(err, "failed to read csv batch")
+					return
+				}
+
+				// can use this as a from table
+				fromExpr := g.F(`read_csv('%s', delim=',', header=True, columns=%s, max_line_size=2000000, parallel=false, quote='"', escape='"', nullstr='\N', auto_detect=false)`, httpURL, duck.GenerateCsvColumns(batchR.Columns))
+
+				streamPartChn <- HttpStreamPart{
+					Index:    partIndex,
+					FromExpr: fromExpr,
+					Columns:  batchR.Columns,
+				}
+				readerCh <- bytes.NewReader(data)
+				<-doneCh
+
+				partIndex++
+			}
 		}
 	}()
 
@@ -1225,4 +1297,62 @@ func (duck *DuckDb) MakeScanQuery(format dbio.FileType, uri string, fsc FileStre
 	}
 
 	return sql
+}
+
+// StripSQLComments removes all SQL comments (-- or /* */) from the provided SQL string
+func StripSQLComments(sql string) (string, error) {
+	inQuote := false
+	inCommentLine := false
+	inCommentMulti := false
+	result := strings.Builder{}
+
+	for i := 0; i < len(sql); i++ {
+		// Check for comment start/end sequences
+		if !inQuote {
+			// Check for start of line comment (--)
+			if i < len(sql)-1 && sql[i] == '-' && sql[i+1] == '-' && !inCommentMulti {
+				inCommentLine = true
+				i++ // Skip the second '-'
+				continue
+			}
+
+			// Check for start of multi-line comment (/*)
+			if i < len(sql)-1 && sql[i] == '/' && sql[i+1] == '*' && !inCommentLine {
+				inCommentMulti = true
+				i++ // Skip the '*'
+				continue
+			}
+
+			// Check for end of multi-line comment (*/)
+			if i < len(sql)-1 && sql[i] == '*' && sql[i+1] == '/' && inCommentMulti {
+				inCommentMulti = false
+				i++ // Skip the '/'
+				continue
+			}
+		}
+
+		// Handle quotes
+		if sql[i] == '\'' && !inCommentLine && !inCommentMulti {
+			// Check for escaped quote ('')
+			if i < len(sql)-1 && sql[i+1] == '\'' {
+				result.WriteByte(sql[i])
+				result.WriteByte(sql[i+1])
+				i++ // Skip the second quote
+				continue
+			}
+			inQuote = !inQuote
+		}
+
+		// End of line comment ends at newline
+		if sql[i] == '\n' && inCommentLine {
+			inCommentLine = false
+		}
+
+		// Only write character if not in a comment
+		if !inCommentLine && !inCommentMulti {
+			result.WriteByte(sql[i])
+		}
+	}
+
+	return result.String(), nil
 }

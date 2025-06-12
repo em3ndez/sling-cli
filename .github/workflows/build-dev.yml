@@ -27,7 +27,7 @@ jobs:
       - name: Set up GoLang
         uses: actions/setup-go@v3
         with:
-          go-version: "1.22"
+          go-version: "1.24"
           cache: false
         
       - name: Get the version
@@ -60,8 +60,8 @@ jobs:
       fail-fast: false
       matrix:
         # runner: [self-hosted-mac, self-hosted-linux, self-hosted-windows]
-        # runner: [macos-latest, ubuntu-20.04, windows-latest]
-        runner: [self-hosted-mac, ubuntu-16, self-hosted-windows]
+        runner: [self-hosted-mac, ubuntu-16, windows-latest]
+        # runner: [self-hosted-mac, ubuntu-16, self-hosted-windows]
         # runner: [self-hosted-mac, ubuntu-16]
 
     steps:
@@ -84,7 +84,7 @@ jobs:
       - name: Set up GoLang
         uses: actions/setup-go@v3
         with:
-          go-version: "1.22"
+          go-version: "1.24"
           cache: false
         
       - name: Load Secrets

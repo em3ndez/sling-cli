@@ -26,17 +26,23 @@ import (
 	"github.com/spf13/cast"
 )
 
-//go:embed examples.sh
-var slingFolder embed.FS
-var examples = ``
-var ctx = g.NewContext(context.Background())
-var telemetry = true
-var interrupted = false
-var machineID = ""
+//go:embed resource/*
+var slingResources embed.FS
+var (
+	examples    = ``
+	ctx         = g.NewContext(context.Background())
+	telemetry   = true
+	interrupted = false
+	machineID   = ""
+)
 
 func init() {
 	env.InitLogger()
 	store.InitDB()
+
+	if os.Getenv("SLING_EXEC_ID") == "" {
+		os.Setenv("SLING_EXEC_ID", sling.NewExecID()) // set exec id if none provided
+	}
 }
 
 var cliRunFlags = []g.Flag{
@@ -398,7 +404,7 @@ func init() {
 	}
 
 	// collect examples
-	examplesBytes, _ := slingFolder.ReadFile("examples.sh")
+	examplesBytes, _ := slingResources.ReadFile("resource/examples.sh")
 	examples = string(examplesBytes)
 
 	cliConns.Make().Add()
@@ -421,13 +427,14 @@ func Track(event string, props ...map[string]interface{}) {
 	}
 
 	properties := g.M(
-		"application", "sling-cli",
-		"version", core.Version,
 		"package", getSlingPackage(),
-		"os", runtime.GOOS+"/"+runtime.GOARCH,
 		"emit_time", time.Now().UnixMicro(),
 		"user_id", machineID,
 	)
+
+	for k, v := range core.TelProps {
+		properties[k] = v
+	}
 
 	for k, v := range env.TelMap {
 		properties[k] = v
@@ -472,7 +479,9 @@ func main() {
 	signal.Notify(interrupt, os.Interrupt)
 	signal.Notify(kill, syscall.SIGTERM)
 
-	sling.ShowProgress = os.Getenv("SLING_SHOW_PROGRESS") != "false"
+	if val := os.Getenv("SLING_SHOW_PROGRESS"); val != "" {
+		sling.ShowProgress = cast.ToBool(os.Getenv("SLING_SHOW_PROGRESS"))
+	}
 	database.UseBulkExportFlowCSV = cast.ToBool(os.Getenv("SLING_BULK_EXPORT_FLOW_CSV"))
 
 	exit := func() {
